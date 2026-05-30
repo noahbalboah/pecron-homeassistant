@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.doppler.yaml
+# runtime state / logs (if you run the scripts from inside the repo)
+*.log
+state.json
+state
+pecron-log.csv
+storm_active

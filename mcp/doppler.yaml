@@ -1,0 +1,3 @@
+setup:
+  project: home-network
+  config: dev
