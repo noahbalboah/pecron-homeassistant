@@ -16,13 +16,19 @@ The documented community workaround for these units is to **toggle a smart plug
 on the grid input by battery SOC**: cut grid to force the unit onto solar +
 battery (islanding), and reconnect grid at a low-SOC floor. That's what this does.
 
+> **Controlling a Pecron yourself? Read [docs/pecron-api-quirks.md](docs/pecron-api-quirks.md) first.**
+> It documents the non-obvious control model this tooling is built around — cloud
+> REST vs (silently-failing) local-TCP writes, the charge-*limit*-not-*speed* lever,
+> no native solar-priority, and the multi-minute write propagation lag.
+
 ## Components
 
 | Path | What |
 |------|------|
-| `mcp/` | A thin **Home Assistant MCP server** (REST wrapper) — read any entity, fetch history, call any service, plus a `pecron_status()` bundle |
-| `scripts/pecron-island.py` | **Solar self-consumption islander** — toggles the grid-input smart plug by SOC (island ≥40% & solar≥load, force grid on ≤25% floor), enforces 0% grid-charge so only solar charges the battery, verifies + retries + iPhone alert on failure |
-| `scripts/storm-charge.py` | **Pre-storm grid fast-charge** — on an NWS Severe/Extreme alert, force grid on + 80% charge speed to fill the battery before the outage; hands control back to the islander when clear |
+| `mcp/` | A thin **MCP server** — read/control Home Assistant *and* read/set the Pecron's charge settings (charge limit + speed) over the reliable cloud-REST path |
+| `scripts/pecron-island.py` | **Solar self-consumption islander** — toggles the grid-input smart plug by SOC (island ≥40% & solar≥load, force grid on ≤25% floor), caps grid charging at 50% via REST so solar fills the rest, with a plug safety-net, charge-speed throttle, and offline alert; verifies + retries |
+| `scripts/storm-charge.py` | **Pre-storm grid fast-charge** — on an NWS Severe/Extreme alert, force grid on + AC charge limit 100% to fill the battery before the outage; reverts to 50% (REST, self-verifying) and hands control back to the islander when clear |
+| `scripts/pecron-energy-rest.py` | Publishes the Pecron's **native lifetime/session energy counters** (PV generated vs grid charged) into HA for accurate solar ROI |
 | `scripts/pecron-log.py` | Read-only **CSV logger** of SOC / solar / load / grid draw for sizing the setup |
 
 ## How the islander works
@@ -34,10 +40,14 @@ SOC ≥ 40% and solar ≥ load → island  (grid OFF, run on battery + solar)
 otherwise                 → hold
 ```
 
-Baseline assumes **AC charging speed 0%** (grid passes through to cover the load
-but never charges the battery) and **AC charge limit 100%** (solar can fill it).
-The Pecron resets charging speed to 100% whenever AC input is cut, so the islander
-re-forces 0% on every grid-on.
+Grid charging is capped with the **AC charge limit** (set to 50% over the cloud
+REST API): grid tops the battery to 50% then passes through, and **solar fills
+50→100%** independently. The charge *limit* — not the charge *speed* — is the lever
+that actually works on this firmware, and it must be written over **cloud REST**
+(local-TCP writes silently fail). The islander asserts it at the floor and keeps the
+smart plug as a physical backstop that islands if grid is ever seen charging past
+the cap. See **[docs/pecron-api-quirks.md](docs/pecron-api-quirks.md)** for the full
+control model and the traps behind all of this.
 
 ## ⚠️ Safety
 
