@@ -6,6 +6,9 @@ hardcoded. Built to talk to the Pecron F5000LFP (and everything else in HA)
 without SSH-ing through the box each time.
 """
 import os
+import re
+import shlex
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -14,12 +17,30 @@ from mcp.server.fastmcp import FastMCP
 HA_URL = os.environ["HA_BASE_URL"].rstrip("/")
 HA_TOKEN = os.environ["HA_TOKEN"]
 
+# Optional: command prefix to invoke pecron-monitor for reliable cloud-REST control
+# of the Pecron's own settings (charge limit/speed) — the path that actually works
+# (see docs/pecron-api-quirks.md). Examples:
+#   "docker exec pecron-monitor-pecron-monitor-1 pecron-monitor --config /config/config.yaml"
+#   "pecron-monitor"
+# Leave unset to disable the pecron_set_*/pecron_get_settings tools.
+PECRON_CMD = os.environ.get("PECRON_MONITOR_CMD", "").strip()
+
 mcp = FastMCP("home-assistant")
 client = httpx.Client(
     base_url=HA_URL,
     headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
     timeout=20,
 )
+
+
+def _pecron(*args, timeout=160):
+    if not PECRON_CMD:
+        raise RuntimeError("PECRON_MONITOR_CMD not set — Pecron control tools are disabled")
+    out = subprocess.run(
+        shlex.split(PECRON_CMD) + list(args),
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return out.stdout + out.stderr
 
 
 def _states():
@@ -126,6 +147,56 @@ def pecron_status() -> dict:
                 "unit": s.get("attributes", {}).get("unit_of_measurement", ""),
             }
     return out
+
+
+@mcp.tool()
+def pecron_get_settings() -> dict:
+    """Read the Pecron's charge settings over the reliable cloud-REST path.
+
+    Surfaces the values local-TCP/MQTT telemetry hides: ac_charge_stop_value_iaos
+    (AC charge limit %), ac_charging_power (speed %), upper/lower_discharge_limit_us,
+    eco_quite_mode_as, ac_nor_open_lab, and lifetime PV/grid-charge energy counters.
+    Requires PECRON_MONITOR_CMD to be set. See docs/pecron-api-quirks.md.
+    """
+    blob = _pecron("--raw", "--rest-only")
+    codes = [
+        "ac_charge_stop_value_iaos", "ac_charging_power", "upper_discharge_limit_us",
+        "lower_discharge_limit_us", "eco_quite_mode_as", "ac_nor_open_lab",
+        "total_energy", "total_ac_charge_energy",
+    ]
+    out = {}
+    for c in codes:
+        m = re.search(rf"{re.escape(c)}[\"\s:]+([0-9]+(?:\.[0-9]+)?|true|false)", blob)
+        out[c] = m.group(1) if m else None
+    return out
+
+
+@mcp.tool()
+def pecron_set_charge_limit(percent: int) -> dict:
+    """Set the AC charge limit (SOC %, firmware min 50) over cloud REST.
+
+    Grid charges the battery up to this SOC then passes through; solar fills above
+    it. This is the reliable charge lever — local writes silently fail. The write
+    propagates over a few minutes; re-read with pecron_get_settings() to verify.
+    """
+    if percent < 50 or percent > 100:
+        return {"ok": False, "error": "limit must be 50-100 (firmware minimum is 50)"}
+    out = _pecron("--control", "ac_charge_stop_value_iaos", str(percent), "--rest-only")
+    ok = "CLOUD REST" in out or "Sent" in out
+    return {"ok": ok, "requested": percent, "verify": "re-read pecron_get_settings() after ~5 min"}
+
+
+@mcp.tool()
+def pecron_set_charge_speed(percent: int) -> dict:
+    """Set the AC charge speed (0-100%, rounded to nearest 10%) over cloud REST.
+
+    Lower it to keep grid charge draw under a grid-input smart plug's safe current.
+    Note: on some firmware the cap only binds when set below the natural charge draw.
+    """
+    enum_val = max(0, min(10, round(percent / 10)))
+    out = _pecron("--control", "ac_charging_power_ios", str(enum_val), "--rest-only")
+    ok = "CLOUD REST" in out or "Sent" in out
+    return {"ok": ok, "requested_pct": percent, "enum": enum_val}
 
 
 if __name__ == "__main__":

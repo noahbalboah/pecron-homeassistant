@@ -9,15 +9,22 @@ battery + solar, and reconnecting grid only at a low-SOC floor.
 Pecron has NO native battery-priority mode and will NOT reconnect grid on its
 own, so THIS SCRIPT IS THE FAILSAFE — it must reliably restore grid at the floor
 (backed only by the downstream CyberPower UPS catching a cutout with a clean
-shutdown). Baseline config assumed: AC Charging Speed 0% (grid never charges the
-battery), AC Charge Limit 100% (solar can fill).
+shutdown).
+
+Charge policy: AC Charge Limit = 50% (set in the Pecron app; firmware-enforced) is
+the everyday lever — grid tops the battery to 50% then holds via passthrough, solar
+fills 50->100%. Because that limit is UNRELIABLE on this firmware (it can silently
+revert to 100%, e.g. after a storm pre-charge), this script also runs a PLUG SAFETY
+NET: if grid is actively charging the battery past ~55%, the limit has reverted ->
+re-assert 50% (best-effort) AND island to physically stop the grid fill.
 
 Run from cron every 3 min with HA_TOKEN exported:
   set -a; . /home/noah/.ha_env; set +a; /usr/bin/python3 /home/noah/.pecron-island/pecron-island.py
 Add --dry-run to log decisions without toggling anything.
 
 Logic each run:
-  SOC <= FLOOR (25)                  -> GRID ON  (failsafe; overrides dwell; alert if it can't switch)
+  SOC <= FLOOR (25)                  -> GRID ON + REST-set AC charge limit 50% (low SOC = device accepts it)
+  grid charging & SOC >= CAP (55)    -> ISLAND (charge limit reverted; plug is the reliable stop)
   SOC >= RESUME (40) and solar>=load -> ISLAND   (grid OFF; respects min-dwell)
   else                               -> hold current state
   SOC unreadable while islanded      -> GRID ON  (can't see the battery -> fail safe) + alert
@@ -25,6 +32,7 @@ Logic each run:
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,16 +48,23 @@ S_GRIDW = "sensor.network_server_rack_current_consumption"
 S_SPEED = "sensor.pecron_f5000lfp_3c1acca326f2_ac_charging_power_setting"
 NOTIFY = "notify/mobile_app_noahs_iphone"
 
-# Pecron resets AC charging speed to 100% whenever AC input is cut (i.e. every
-# island). We must force it back to 0% on each grid-on so grid passes through
-# WITHOUT charging the battery (solar stays the only charger).
+# The reliable charge lever is the AC charge LIMIT (SOC%), read+written via the
+# CLOUD REST API — local-TCP/MQTT writes silently don't stick. KEY FIRMWARE RULE:
+# the device REJECTS setting the limit below the current SOC, so we only assert it
+# at the floor (low SOC) where it WILL take, then read it back to verify.
 CONTAINER = "pecron-monitor-pecron-monitor-1"
-SPEED_CTRL = "ac_charging_power_ios"  # enum 0..10 == 0..100%
+LIMIT_CTRL = "ac_charge_stop_value_iaos"  # INT %, firmware min 50 — the real charge lever
+SPEED_CTRL = "ac_charging_power_ios"      # ENUM 0..10 == 0..100% AC charge speed
 STORM_FLAG = "/home/noah/.pecron-island/storm_active"
 
 FLOOR = 25          # SOC% at/below which grid is forced on (failsafe)
 RESUME = 40         # SOC% at/above which we island again (with solar>=load)
 CRITICAL = 15       # SOC% for urgent alert
+AC_CHARGE_LIMIT = 50        # SOC% grid charge target (firmware min; also set in app)
+SAFE_SPEED_PCT = 60         # cap AC charge speed so grid draw stays under the EP25 plug's safe current
+SAFE_SPEED_ENUM = "6"       # ac_charging_power_ios enum for 60%
+SAFETY_CAP = 55             # SOC% above which, IF grid is still charging, the limit reverted
+CHARGE_DETECT_MARGIN = 300  # EP25 watts above load that means grid is charging the battery
 GRID_FLOW_W = 100   # EP25 watts above this == grid actually flowing
 MIN_DWELL = timedelta(minutes=15)
 ALERT_COOLDOWN = timedelta(minutes=30)
@@ -98,20 +113,101 @@ def ha_service(domain_service, data):
         return r.status
 
 
-def set_charge_speed_off():
-    """Force AC charging speed to 0% via the pecron CLI (grid pass-through, no charge)."""
+def rest_get_limit():
+    """Read the AC charge limit (SOC%) via the CLOUD REST API — the reliable read-back
+    (local-TCP/MQTT don't expose it). Returns int or None."""
+    try:
+        r = subprocess.run(
+            ["docker", "exec", CONTAINER, "pecron-monitor", "--config",
+             "/config/config.yaml", "--raw", "--rest-only"],
+            check=True, capture_output=True, timeout=150, text=True,
+        )
+        m = re.search(r"ac_charge_stop_value_iaos[\"\s:]+(\d+)", r.stdout + r.stderr)
+        return int(m.group(1)) if m else None
+    except Exception as e:
+        log(f"WARN REST read of AC charge limit failed: {e}")
+        return None
+
+
+def rest_set_limit(val):
+    """Set the AC charge limit (SOC%) via the CLOUD REST API (the reliable write path).
+    NOTE: the firmware rejects setting the limit BELOW the current SOC, so only call
+    this at low SOC (e.g. the floor). Returns True if the cloud accepted the command."""
     if DRY:
-        log("(DRY) would set AC charging speed 0%")
+        log(f"(DRY) would REST-set AC charge limit {val}%")
+        return False
+    try:
+        r = subprocess.run(
+            ["docker", "exec", CONTAINER, "pecron-monitor", "--config",
+             "/config/config.yaml", "--control", LIMIT_CTRL, str(val), "--rest-only"],
+            check=True, capture_output=True, timeout=150, text=True,
+        )
+        ok = "via CLOUD REST" in (r.stdout + r.stderr)
+        log(f"REST-set AC charge limit {val}% (cloud accepted={ok})")
+        return ok
+    except Exception as e:
+        log(f"WARN REST-set AC charge limit {val}% failed: {e}")
+        return False
+
+
+def assert_charge_limit():
+    """At low SOC the firmware WILL accept a lower AC charge limit. Read it via REST;
+    if it isn't AC_CHARGE_LIMIT, set it (REST) — verified by the read on the next run.
+    This is the reliable, verifiable cap; the plug safety-net is the physical backup."""
+    cur_limit = rest_get_limit()
+    if cur_limit is None:
+        log("AC charge limit unreadable via REST -> relying on plug safety-net")
+        return
+    if cur_limit == AC_CHARGE_LIMIT:
+        log(f"AC charge limit = {AC_CHARGE_LIMIT}% (REST-verified) -> grid caps there")
+        return
+    log(f"AC charge limit = {cur_limit}% (want {AC_CHARGE_LIMIT}%), SOC low -> REST-set")
+    rest_set_limit(AC_CHARGE_LIMIT)
+
+
+def rest_get_speed():
+    """Read the AC charge speed (%) via the CLOUD REST API. Returns int or None."""
+    try:
+        r = subprocess.run(
+            ["docker", "exec", CONTAINER, "pecron-monitor", "--config",
+             "/config/config.yaml", "--raw", "--rest-only"],
+            check=True, capture_output=True, timeout=150, text=True,
+        )
+        m = re.search(r"ac_charging_power[\"\s:]+(\d+)", r.stdout + r.stderr)
+        return int(m.group(1)) if m else None
+    except Exception as e:
+        log(f"WARN REST read of AC charge speed failed: {e}")
+        return None
+
+
+def rest_set_speed(enum_val):
+    """Set the AC charge speed via the CLOUD REST API (enum 0..10 == 0..100%)."""
+    if DRY:
+        log(f"(DRY) would REST-set AC charge speed enum {enum_val}")
         return
     try:
         subprocess.run(
             ["docker", "exec", CONTAINER, "pecron-monitor", "--config",
-             "/config/config.yaml", "--control", SPEED_CTRL, "0"],
+             "/config/config.yaml", "--control", SPEED_CTRL, str(enum_val), "--rest-only"],
             check=True, capture_output=True, timeout=150, text=True,
         )
-        log("set AC charging speed 0% (grid pass-through, battery not charged from grid)")
+        log(f"REST-set AC charge speed {SAFE_SPEED_PCT}% (protect EP25 plug from over-current)")
     except Exception as e:
-        log(f"WARN could not set charging speed 0%: {e}")
+        log(f"WARN REST-set AC charge speed failed: {e}")
+
+
+def assert_charge_speed():
+    """Cap grid charge speed so the draw through the EP25 plug stays under its safe
+    current. The firmware resets speed to 100% whenever AC input is cut, so re-assert
+    when grid is on at the floor. Only writes when it's above the cap."""
+    cur = rest_get_speed()
+    if cur is None:
+        return
+    if cur <= SAFE_SPEED_PCT:
+        log(f"AC charge speed = {cur}% (<= {SAFE_SPEED_PCT}% cap) -> ok")
+        return
+    log(f"AC charge speed = {cur}% > {SAFE_SPEED_PCT}% cap -> throttling")
+    rest_set_speed(SAFE_SPEED_ENUM)
 
 
 def num(state):
@@ -204,20 +300,32 @@ def main():
     cur = "on" if sw == "on" else "off"
     log(f"soc={soc} pv={pv} load={load} grid_switch={cur} grid_w={gridw} chg_speed={speed}")
 
+    # Telemetry restored after an offline episode -> clear the flag + notify.
+    if soc is not None and st.get("offline"):
+        notify("✅ Pecron back online", f"Telemetry restored (SOC {soc:.0f}%).", st)
+        st["offline"] = False
+        save_state(st)
+
     # During a storm, storm-charge owns the plug + charging — stand down.
     if os.path.exists(STORM_FLAG):
         log("storm mode active -> yielding to storm-charge")
         return
 
-    # SOC unreadable -> fail safe (can't see the battery, don't risk islanding)
+    # SOC unreadable -> the Pecron is offline/blind (cloud/Wi-Fi down or unit off).
+    # Fail safe (force grid on, don't risk islanding) and alert once per episode.
     if soc is None:
+        if not st.get("offline"):
+            notify("⚠️ Pecron OFFLINE",
+                   "No telemetry from the Pecron (cloud/Wi-Fi down or unit off). "
+                   "Forcing grid ON as failsafe; control is blind until it returns.", st)
+            st["offline"] = True
         if cur != "on":
-            log("SOC unreadable while islanded -> forcing GRID ON")
+            log("SOC unreadable (offline) while islanded -> forcing GRID ON")
             if not set_grid("on", st):
                 notify("⚠️ Pecron grid restore FAILED",
                        "SOC unreadable and could not turn grid on. Check the homelab.", st)
         else:
-            log("SOC unreadable but grid already on -> safe, hold")
+            log("SOC unreadable (offline) but grid already on -> safe, hold")
         save_state(st)
         return
 
@@ -226,20 +334,48 @@ def main():
         flowing = (gridw is not None and gridw > GRID_FLOW_W) or (gridw is None and cur == "on")
         if not flowing:
             log(f"FAILSAFE: SOC {soc:.0f}% <= {FLOOR}% and grid not flowing -> GRID ON")
-            if set_grid("on", st):
-                set_charge_speed_off()  # grid passes through but must NOT charge the battery
-            else:
+            if not set_grid("on", st):
                 notify("⚠️ Pecron grid restore FAILED",
                        f"Battery {soc:.0f}% and could NOT switch grid on after retries. "
                        f"Homelab may shut down — check now.", st)
         else:
             log(f"SOC {soc:.0f}% <= floor but grid already flowing ({gridw}W) -> hold")
-            if speed is not None and speed != 0:
-                log(f"grid flowing but charge speed {speed:.0f}% != 0 -> correcting (no grid charging)")
-                set_charge_speed_off()
+        # SOC is low here -> the firmware WILL accept a lower AC charge limit now.
+        # This is the reliable, verifiable cap: grid tops to 50% then holds, solar fills the rest.
+        assert_charge_limit()
+        # Cap charge speed too, so the grid draw through the EP25 plug stays under its safe current.
+        assert_charge_speed()
         if soc <= CRITICAL:
             notify("⚠️ Pecron battery critically low",
                    f"Battery at {soc:.0f}% (cutoff 5%). Grid {'on' if st.get('grid')=='on' else 'NOT confirmed'}.", st)
+        save_state(st)
+        return
+
+    # SAFETY NET: grid actively charging the battery past the cap == the 50% AC
+    # charge limit has reverted (e.g. storm-charge set 100% and the CLI revert
+    # silently failed). Re-assert 50% AND island to physically stop the grid fill.
+    # Distinguishes grid-charging (grid_w >> load) from solar-charging (grid_w ~ load),
+    # so it never fires when SOLAR is the one filling the battery above 50%.
+    charging_from_grid = (
+        cur == "on"
+        and gridw is not None
+        and load is not None
+        and gridw > load + CHARGE_DETECT_MARGIN
+    )
+    if charging_from_grid and soc >= SAFETY_CAP:
+        log(f"SAFETY: grid charging past cap (SOC {soc:.0f}% >= {SAFETY_CAP}%, "
+            f"grid {gridw:.0f}W >> load {load:.0f}W) -> AC charge limit reverted to 100%")
+        # Can't lower the limit now (firmware won't set it below the current SOC) —
+        # islanding (cut the plug) is the reliable physical stop. The limit is
+        # re-asserted to 50% by assert_charge_limit() at the floor once SOC is low.
+        notify("⚠️ Pecron grid-charging past 50%",
+               f"Battery {soc:.0f}%, grid pulling {gridw:.0f}W (load {load:.0f}W). "
+               f"Charge limit reverted — islanding to stop the grid fill.", st)
+        last_toggle = parse_ts(st.get("last_toggle"))
+        if last_toggle is not None and now() - last_toggle < MIN_DWELL:
+            log("SAFETY island deferred (min-dwell) -> will island next eligible run")
+        else:
+            set_grid("off", st)
         save_state(st)
         return
 
