@@ -12,7 +12,6 @@ grid) is worth building:
   pv_w           Pecron DC/PV input (W)                -> live solar
   load_w         Pecron AC output (W)                  -> homelab load on the Pecron
   grid_kwh_today EP25 cumulative grid energy today     -> the kWh a night-discharge could offset
-  salad          Salad-allowed boolean                 -> is surplus going to Salad
 
 Run from cron every 5 min with the HA token in the environment:
   . /home/noah/.ha_env && /usr/bin/python3 /home/noah/.pecron-log/pecron-log.py
@@ -32,7 +31,6 @@ SENSORS = {
     "pv_w": "sensor.pecron_f5000lfp_3c1acca326f2_dc_input_power",
     "load_w": "sensor.pecron_f5000lfp_3c1acca326f2_output_power",
     "grid_kwh_today": "sensor.network_server_rack_today_s_consumption",
-    "salad": "input_boolean.pecron_salad_allowed",
 }
 
 
